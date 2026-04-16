@@ -15,10 +15,11 @@ Wire format uses multipart ZMQ message:
 from __future__ import annotations
 
 import argparse
+import csv
 import glob
-import json
 import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -50,6 +51,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lidar-file", default=None, help="LiDAR file: .pcd/.bin/.npy bytes payload")
     p.add_argument("--lidar-loop", action="store_true", help="Reload LiDAR file each frame")
     p.add_argument("--label", default="demo", help="Vehicle id / stream label")
+    p.add_argument("--max-frames", type=int, default=0, help="Stop after N frames, 0 means run forever")
+    p.add_argument("--ack-connect", default=None, help="Optional ACK SUB endpoint, e.g. tcp://100.x.x.x:5556")
+    p.add_argument("--ack-topic", default="ack", help="ACK topic when --ack-connect is enabled")
+    p.add_argument("--rtt-log", default=None, help="Optional CSV path for RTT records on sender side")
+    p.add_argument("--pending-ack-window", type=int, default=2048, help="Max in-flight frame IDs to track for RTT")
     return p.parse_args()
 
 
@@ -157,14 +163,36 @@ def main() -> int:
     sock.setsockopt(zmq.CONFLATE, 1)
     sock.bind(args.bind)
 
+    ack_sock = None
+    ack_topic_bytes = args.ack_topic.encode("utf-8")
+    if args.ack_connect:
+        ack_sock = ctx.socket(zmq.SUB)
+        ack_sock.setsockopt(zmq.RCVHWM, 1024)
+        ack_sock.setsockopt(zmq.SUBSCRIBE, ack_topic_bytes)
+        ack_sock.connect(args.ack_connect)
+
+    rtt_csv_file = None
+    rtt_csv_writer = None
+    if args.rtt_log:
+        rtt_path = Path(args.rtt_log)
+        rtt_path.parent.mkdir(parents=True, exist_ok=True)
+        rtt_csv_file = rtt_path.open("a", newline="", encoding="utf-8")
+        rtt_csv_writer = csv.writer(rtt_csv_file)
+        if rtt_path.stat().st_size == 0:
+            rtt_csv_writer.writerow(
+                ["ack_recv_ts_unix", "frame_id", "rtt_ms", "sender_ts_unix", "receiver_recv_ts_unix", "label"]
+            )
+
     cams: List[CameraSource] = []
     if cam_devices is not None:
         cams = open_cameras(cam_devices)
 
     period_s = 1.0 / args.fps if args.fps > 0 else 0.0
     topic_bytes = args.topic.encode("utf-8")
+    pending_ts = OrderedDict()
 
     print(f"[sender] bind={args.bind}, topic={args.topic}, fps={args.fps}, label={args.label}")
+    frame_id = 0
     try:
         while True:
             t0 = time.time()
@@ -185,6 +213,7 @@ def main() -> int:
                 "ver": 1,
                 "label": args.label,
                 "ts_unix": now,
+                "frame_id": frame_id,
                 "cam_count": 6,
                 "img_fmt": "jpg",
                 "img_size": [target_size[0], target_size[1]],
@@ -195,6 +224,41 @@ def main() -> int:
 
             multipart = [topic_bytes, header_bytes, *jpg_list, lidar_payload]
             sock.send_multipart(multipart, copy=False)
+            pending_ts[frame_id] = now
+            if len(pending_ts) > args.pending_ack_window:
+                pending_ts.popitem(last=False)
+            frame_id += 1
+            if args.max_frames > 0 and frame_id >= args.max_frames:
+                print(f"[sender] reached max-frames={args.max_frames}, exiting")
+                break
+
+            if ack_sock is not None:
+                while True:
+                    try:
+                        ack_parts = ack_sock.recv_multipart(flags=zmq.NOBLOCK)
+                    except zmq.Again:
+                        break
+                    if len(ack_parts) < 2:
+                        continue
+                    ack_header = msgpack.unpackb(ack_parts[1], raw=False)
+                    ack_frame_id = int(ack_header.get("frame_id", -1))
+                    sender_ts = pending_ts.pop(ack_frame_id, None)
+                    if sender_ts is None:
+                        continue
+                    ack_now = time.time()
+                    rtt_ms = max((ack_now - sender_ts) * 1000.0, 0.0)
+                    if rtt_csv_writer is not None:
+                        rtt_csv_writer.writerow(
+                            [
+                                ack_now,
+                                ack_frame_id,
+                                f"{rtt_ms:.3f}",
+                                sender_ts,
+                                ack_header.get("receiver_recv_ts_unix", ""),
+                                args.label,
+                            ]
+                        )
+                        rtt_csv_file.flush()
 
             elapsed = time.time() - t0
             if period_s > 0 and elapsed < period_s:
@@ -204,7 +268,11 @@ def main() -> int:
     finally:
         for c in cams:
             c.cap.release()
+        if ack_sock is not None:
+            ack_sock.close(0)
         sock.close(0)
+        if rtt_csv_file is not None:
+            rtt_csv_file.close()
         ctx.term()
     return 0
 

@@ -60,6 +60,81 @@ python tools/edge_cloud_demo/receiver.py \
 
 > `100.x.x.x` 替换成车端的 Tailscale IP。
 
+## 连续测试（一直传同一套输入 + 记录延时）
+
+你现在的诉求可以直接这样测：发送端循环发送同一组 6 张图片和 1 个 pcd，接收端持续统计和落盘延时。
+
+### 车端（持续发送）
+
+```bash
+python tools/edge_cloud_demo/sender.py \
+  --bind tcp://*:5555 \
+  --cam-files cam0.jpg cam1.jpg cam2.jpg cam3.jpg cam4.jpg cam5.jpg \
+  --lidar-file sample.pcd \
+  --fps 10 \
+  --label car_A
+```
+
+> 默认就是无限循环；如果你想固定跑 3000 帧做压测，可加 `--max-frames 3000`。
+
+### 云端（记录延时 CSV）
+
+```bash
+python tools/edge_cloud_demo/receiver.py \
+  --connect tcp://100.x.x.x:5555 \
+  --headless \
+  --latency-log logs/latency.csv \
+  --print-every 50 \
+  --max-frames 3000
+```
+
+CSV 字段如下：`recv_ts_unix,sender_ts_unix,frame_id,latency_ms,lidar_bytes,label`。
+
+### 加 ACK 通道记录 RTT（推荐）
+
+> 这个 RTT 不依赖车端/云端时钟同步，更适合真实网络监控。
+
+云端开启 ACK PUB：
+
+```bash
+python tools/edge_cloud_demo/receiver.py \
+  --connect tcp://100.x.x.x:5555 \
+  --ack-bind tcp://*:5556 \
+  --ack-topic ack \
+  --headless \
+  --latency-log logs/latency.csv
+```
+
+车端订阅 ACK 并记录 RTT：
+
+```bash
+python tools/edge_cloud_demo/sender.py \
+  --bind tcp://*:5555 \
+  --ack-connect tcp://100.y.y.y:5556 \
+  --ack-topic ack \
+  --rtt-log logs/rtt.csv \
+  --cam-files cam0.jpg cam1.jpg cam2.jpg cam3.jpg cam4.jpg cam5.jpg \
+  --lidar-file sample.pcd
+```
+
+RTT CSV 字段：`ack_recv_ts_unix,frame_id,rtt_ms,sender_ts_unix,receiver_recv_ts_unix,label`。
+
+### 快速查看结果
+
+```bash
+python - <<'PY'
+import csv, statistics
+rows=list(csv.DictReader(open("logs/latency.csv",encoding="utf-8")))
+lat=[float(r["latency_ms"]) for r in rows]
+lat=lat[-3000:]  # 只看本轮
+lat_sorted=sorted(lat)
+def pct(p):
+    i=max(int(len(lat_sorted)*p)-1,0)
+    return lat_sorted[i]
+print(f"count={len(lat)} avg={statistics.mean(lat):.2f}ms p50={pct(0.50):.2f}ms p95={pct(0.95):.2f}ms p99={pct(0.99):.2f}ms")
+PY
+```
+
 ## 关于你问的“部署时是文件还是数据流？”
 
 真实部署时，你的理解是正确的：
