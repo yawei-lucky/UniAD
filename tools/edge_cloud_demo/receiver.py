@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import time
 from pathlib import Path
 from typing import List
@@ -28,9 +27,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rcvhwm", type=int, default=1, help="SUB receive high-water mark")
     p.add_argument("--save-dir", default=None, help="Optional directory to dump latest images + lidar")
     p.add_argument("--headless", action="store_true", help="Do not open OpenCV windows")
-    p.add_argument("--latency-log", default=None, help="Optional CSV file to append latency metrics")
-    p.add_argument("--print-every", type=int, default=30, help="Print rolling stats every N frames")
-    p.add_argument("--max-frames", type=int, default=0, help="Stop after N received frames, 0 means run forever")
     return p.parse_args()
 
 
@@ -70,22 +66,11 @@ def main() -> int:
     sock.connect(args.connect)
 
     print(f"[receiver] connect={args.connect}, topic={args.topic}")
-    csv_file = None
-    csv_writer = None
-    if args.latency_log:
-        latency_path = Path(args.latency_log)
-        latency_path.parent.mkdir(parents=True, exist_ok=True)
-        csv_file = latency_path.open("a", newline="", encoding="utf-8")
-        csv_writer = csv.writer(csv_file)
-        if latency_path.stat().st_size == 0:
-            csv_writer.writerow(["recv_ts_unix", "sender_ts_unix", "frame_id", "latency_ms", "lidar_bytes", "label"])
 
     if not args.headless:
         for name in WINDOW_NAMES:
             cv2.namedWindow(name, cv2.WINDOW_NORMAL)
 
-    recv_count = 0
-    latency_window = []
     try:
         while True:
             parts = sock.recv_multipart()
@@ -110,31 +95,10 @@ def main() -> int:
             images = [decode_jpeg(x) for x in image_blobs]
             now = time.time()
             latency_ms = max((now - float(header.get("ts_unix", now))) * 1000.0, 0.0)
-            recv_count += 1
-            latency_window.append(latency_ms)
             info = (
                 f"label={header.get('label', '')} | latency={latency_ms:.1f}ms | "
                 f"lidar={len(lidar_blob)/1024:.1f}KB"
             )
-            if csv_writer is not None:
-                csv_writer.writerow([
-                    now,
-                    header.get("ts_unix", ""),
-                    header.get("frame_id", ""),
-                    f"{latency_ms:.3f}",
-                    len(lidar_blob),
-                    header.get("label", ""),
-                ])
-                csv_file.flush()
-
-            if args.print_every > 0 and recv_count % args.print_every == 0:
-                avg_ms = sum(latency_window) / len(latency_window)
-                p95_ms = sorted(latency_window)[max(int(len(latency_window) * 0.95) - 1, 0)]
-                print(
-                    f"[receiver][stats] frames={recv_count} "
-                    f"avg={avg_ms:.1f}ms p95={p95_ms:.1f}ms latest={latency_ms:.1f}ms"
-                )
-                latency_window = []
 
             if args.save_dir:
                 save_payload(Path(args.save_dir), images, lidar_blob, header)
@@ -148,16 +112,11 @@ def main() -> int:
                     break
             else:
                 print(f"[receiver] {info}")
-            if args.max_frames > 0 and recv_count >= args.max_frames:
-                print(f"[receiver] reached max-frames={args.max_frames}, exiting")
-                break
     except KeyboardInterrupt:
         print("\n[receiver] stopped")
     finally:
         sock.close(0)
         ctx.term()
-        if csv_file is not None:
-            csv_file.close()
         if not args.headless:
             cv2.destroyAllWindows()
     return 0

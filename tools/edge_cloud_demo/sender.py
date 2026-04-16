@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -49,7 +50,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lidar-file", default=None, help="LiDAR file: .pcd/.bin/.npy bytes payload")
     p.add_argument("--lidar-loop", action="store_true", help="Reload LiDAR file each frame")
     p.add_argument("--label", default="demo", help="Vehicle id / stream label")
-    p.add_argument("--max-frames", type=int, default=0, help="Stop after N frames, 0 means run forever")
     return p.parse_args()
 
 
@@ -165,7 +165,6 @@ def main() -> int:
     topic_bytes = args.topic.encode("utf-8")
 
     print(f"[sender] bind={args.bind}, topic={args.topic}, fps={args.fps}, label={args.label}")
-    frame_id = 0
     try:
         while True:
             t0 = time.time()
@@ -186,7 +185,6 @@ def main() -> int:
                 "ver": 1,
                 "label": args.label,
                 "ts_unix": now,
-                "frame_id": frame_id,
                 "cam_count": 6,
                 "img_fmt": "jpg",
                 "img_size": [target_size[0], target_size[1]],
@@ -197,10 +195,6 @@ def main() -> int:
 
             multipart = [topic_bytes, header_bytes, *jpg_list, lidar_payload]
             sock.send_multipart(multipart, copy=False)
-            frame_id += 1
-            if args.max_frames > 0 and frame_id >= args.max_frames:
-                print(f"[sender] reached max-frames={args.max_frames}, exiting")
-                break
 
             elapsed = time.time() - t0
             if period_s > 0 and elapsed < period_s:
